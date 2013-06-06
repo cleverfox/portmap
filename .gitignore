@@ -1,0 +1,8 @@
+*~
+*.swp
+*.o
+assign
+pmassign
+portmap
+tags
+pmtest
