@@ -11,6 +11,13 @@
 #include "portmap.h"
 
 #define LOG_WRITE(loglevel, ...) {printf(__VA_ARGS__);printf("\n");}
+struct connection {
+    int fd;
+    uint16_t rlen;
+    uint8_t *rbuf;
+    uint16_t offset;
+    struct event *e;
+};
 struct service {
     uint16_t port;
     uint16_t protocol;
@@ -35,42 +42,72 @@ struct {
 } pm;
 
 void handleu(evutil_socket_t fd, short what, void *arg){
-    printf("Got an event on socket %d:%s%s%s%s\n",
+    struct connection *c=arg;
+    printf("Got an event on service socket %d:%s%s%s%s\n",
             (int) fd,
             (what&EV_TIMEOUT) ? " timeout" : "",
             (what&EV_READ)    ? " read" : "",
             (what&EV_WRITE)   ? " write" : "",
             (what&EV_SIGNAL)  ? " signal" : "");
-    union {
-        char raw[64];
-        struct assign as;
-    } buffer;
-    int len=read(fd,buffer.raw,2); 
-    printf("Read %d bytes. expected %d\n",len,2);
-    if(len!=2){
-        event_del(arg);
+    if(!c->rbuf){
+        uint16_t lenbuf;
+        size_t len=read(fd,&lenbuf,2); 
+        if(len!=2){
+            event_del(c->e);
+            close(fd);
+            free(c->e);
+            free(c);
+            printf("Connection error on fd %d. Can't read message length. Connection closed\n",fd);
+            return;
+        }
+        c->rlen=htons(lenbuf);
+        printf("Read %ld bytes. expected %d\n",len,2);
+        uint8_t *buf=malloc(c->rlen+1);
+        bzero(buf,c->rlen+1);
+        memcpy(buf,&lenbuf,2);
+        c->rbuf=buf;
+        c->offset=2;
+
+    }
+    ssize_t len=read(fd,c->rbuf+c->offset,c->rlen-c->offset); 
+    if(len<0){
+        event_del(c->e);
         close(fd);
-        free(arg);
+        free(c->e);
+        free(c->rbuf);
+        free(c);
+        printf("Connection closed on fd %d\n",fd);
         return;
     }
-    len=read(fd,buffer.raw+2,buffer.as.length-2); 
-    printf("Read %d bytes. expected %d\n",len,buffer.as.length-2);
+    printf("Read %ld bytes. expected %d\n",len,c->rlen-c->offset);
+    c->offset+=len;
+    if(c->offset==c->rlen){
+        printf("Got complete message\n");
+        free(c->rbuf);
+        c->rbuf=NULL;
+        c->rlen=0;
+        c->offset=0;
+    }
 }
 
 void acceptu(evutil_socket_t fd, short what, void *arg){
-    printf("Got an event on socket %d:%s%s%s%s\n",
+    printf("Got an event on listen unix socket %d:%s%s%s%s\n",
             (int) fd,
             (what&EV_TIMEOUT) ? " timeout" : "",
             (what&EV_READ)    ? " read" : "",
             (what&EV_WRITE)   ? " write" : "",
             (what&EV_SIGNAL)  ? " signal" : "");
     int cfd=accept(fd,NULL,NULL);
-    struct event *e=event_new(pm.loop, cfd, EV_READ|EV_PERSIST, handleu, e);
-    event_add(e,NULL);
+    struct connection *con=malloc(sizeof(struct connection));
+    bzero(con,sizeof(struct connection));
+    con->fd=cfd;
+    con->e=event_new(pm.loop, cfd, EV_READ|EV_PERSIST, handleu, con);
+    event_add(con->e,NULL);
+    printf("Service accepted fd %d\n",cfd);
 };
 
 void acceptc(evutil_socket_t fd, short what, void *arg){
-    printf("Got an event on socket %d:%s%s%s%s\n",
+    printf("Got an event on listen inet socket %d:%s%s%s%s\n",
             (int) fd,
             (what&EV_TIMEOUT) ? " timeout" : "",
             (what&EV_READ)    ? " read" : "",

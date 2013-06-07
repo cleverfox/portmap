@@ -28,6 +28,7 @@ int main(int argc, char *argv[]){
     int len=sizeof(struct assign)+strlen(argv[1])+1;
     struct assign *a=alloca(len);
     bzero(a,len);
+    a->length=htons(len);
     strcpy(a->servicename,argv[0]);
     int r=send(fdu,a,len,0);
     printf("Request sent: %d\n",r);
