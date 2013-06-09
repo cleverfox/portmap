@@ -5,9 +5,14 @@
 #include <arpa/inet.h>
 #include <sys/un.h>
 #include <stdlib.h>
+#include <netdb.h>
 #include "portmap.h"
 
 int main(int argc, char *argv[]){
+    if(argc<3){
+        printf("min 2 args\n");
+        exit(10);
+    }
     struct sockaddr_un sun;
     sun.sun_family=AF_UNIX;
     sprintf(sun.sun_path,"/tmp/portmap.1248");
@@ -29,10 +34,15 @@ int main(int argc, char *argv[]){
     struct assign *a=alloca(len);
     bzero(a,len);
     a->length=htons(len);
-    strcpy(a->servicename,argv[0]);
+    strcpy(a->servicename,argv[1]);
+    uint16_t portnum=strtol(argv[2], (char **)NULL, 10);
+    a->port=htons(portnum);
+    a->magic_number=htons(PM_SETUP);
+    struct protoent * p=getprotobyname("tcp");
+    a->ipprotocol=p->p_proto;
     int r=send(fdu,a,len,0);
     printf("Request sent: %d\n",r);
-    sleep(90);
+    while(read(fdu,a,len)>0);
     return 0;
 }
 

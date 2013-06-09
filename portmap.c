@@ -8,9 +8,18 @@
 #include <sys/queue.h>
 #include <stdlib.h>
 #include <event2/event.h>
+#include <netdb.h>
 #include "portmap.h"
 
 #define LOG_WRITE(loglevel, ...) {printf(__VA_ARGS__);printf("\n");}
+struct client {
+    int fd;
+    uint16_t rlen;
+    char rbuf[256];
+    uint16_t offset;
+    struct event *e;
+    char tos;
+};
 struct connection {
     int fd;
     uint16_t rlen;
@@ -23,7 +32,7 @@ struct service {
     uint16_t protocol;
     uint8_t version;
     char protoname[16];
-    int sockfd;
+    struct connection *owner;
     TAILQ_ENTRY(service) entries;
     char servicename[];
 };
@@ -41,6 +50,8 @@ struct {
     TAILQ_HEAD(servicetailq,service) services;
 } pm;
 
+char banner[]="MiniPortmap version 0.1\r\n";
+
 void handleu(evutil_socket_t fd, short what, void *arg){
     struct connection *c=arg;
     printf("Got an event on service socket %d:%s%s%s%s\n",
@@ -52,12 +63,24 @@ void handleu(evutil_socket_t fd, short what, void *arg){
     if(!c->rbuf){
         uint16_t lenbuf;
         size_t len=read(fd,&lenbuf,2); 
-        if(len!=2){
+        if(len==0 || len!=2){
             event_del(c->e);
             close(fd);
             free(c->e);
+
+            struct service *s,*s1;
+            TAILQ_FOREACH_SAFE(s,&pm.services,entries,s1){
+                if(s->owner==c){
+                    TAILQ_REMOVE(&pm.services,s,entries);
+                    free(s);
+                }
+            }
+
             free(c);
-            printf("Connection error on fd %d. Can't read message length. Connection closed\n",fd);
+            if(len==0)
+                printf("Connection finished on fd %d\n",fd);
+            else
+                printf("Connection error on fd %d. Can't read message length. Connection closed\n",fd);
             return;
         }
         c->rlen=htons(lenbuf);
@@ -67,7 +90,6 @@ void handleu(evutil_socket_t fd, short what, void *arg){
         memcpy(buf,&lenbuf,2);
         c->rbuf=buf;
         c->offset=2;
-
     }
     ssize_t len=read(fd,c->rbuf+c->offset,c->rlen-c->offset); 
     if(len<0){
@@ -83,10 +105,80 @@ void handleu(evutil_socket_t fd, short what, void *arg){
     c->offset+=len;
     if(c->offset==c->rlen){
         printf("Got complete message\n");
+        struct assign *as=(struct assign*)c->rbuf;
+        struct protoent *p=getprotobynumber(as->ipprotocol);
+        printf("Setup service %s at port %s %d with protocol %s version %d\n",
+                as->servicename,p->p_name,htons(as->port),as->protoname,as->version);
+        int slen=sizeof(struct service)+strlen(as->servicename)+1;
+        struct service *s=malloc(slen);
+        bzero(s,slen);
+        s->port=ntohs(as->port);
+        s->protocol=(as->ipprotocol);
+        strcpy(s->servicename,as->servicename);
+        strcpy(s->protoname ,as->protoname);
+        s->version=as->version;
+        s->owner=c;
+        TAILQ_INSERT_TAIL(&pm.services,s,entries);
+
         free(c->rbuf);
         c->rbuf=NULL;
         c->rlen=0;
         c->offset=0;
+    }
+}
+
+void handlec(evutil_socket_t fd, short what, void *arg){
+    struct client *c=arg;
+    printf("Got an event on client socket %d:%s%s%s%s\n",
+            (int) fd,
+            (what&EV_TIMEOUT) ? " timeout" : "",
+            (what&EV_READ)    ? " read" : "",
+            (what&EV_WRITE)   ? " write" : "",
+            (what&EV_SIGNAL)  ? " signal" : "");
+
+    if(what&EV_TIMEOUT){
+        c->tos--;
+        if(c->tos<=0){
+            event_del(c->e);
+            close(fd);
+            free(c->e);
+            free(c);
+            printf("Idle timeout. Connection finished on fd %d\n",fd);
+            return;
+        }
+    }
+    if(what&EV_READ){
+        c->tos=2;
+        size_t len=read(fd,c->rbuf,c->rlen-c->offset); 
+        if(len==0){
+            event_del(c->e);
+            close(fd);
+            free(c->e);
+            free(c);
+            printf("Connection finished on fd %d\n",fd);
+            return;
+        }
+        printf("Read %ld bytes. expected %d\n",len,c->rlen-c->offset);
+        c->offset+=len;
+        char *fs;
+        while((fs=strstr((const char*)c->rbuf,"\r\n"))!=NULL){
+            *fs='\0';
+            char slen=(long)fs-(long)c->rbuf;
+            printf("Received %s %d\n",c->rbuf,slen);
+            if(strncasecmp(c->rbuf,"lookup ",7)==0){
+                //perform lookup
+                struct service *s;
+                char obuf[255];
+                TAILQ_FOREACH(s,&pm.services,entries){
+                    struct protoent *p=getprotobynumber(s->protocol);
+                    sprintf(obuf,"S %s %s %d\r\n",s->servicename,p->p_name,s->port);
+                    send(fd,obuf,strlen(obuf),0);
+                }
+                send(fd,"%END\r\n\r\n",8,0);
+            }
+            strcpy(c->rbuf,fs+2);
+            c->offset-=2+slen;
+        }
     }
 }
 
@@ -114,6 +206,19 @@ void acceptc(evutil_socket_t fd, short what, void *arg){
             (what&EV_WRITE)   ? " write" : "",
             (what&EV_SIGNAL)  ? " signal" : "");
     int cfd=accept(fd,NULL,NULL);
+    
+    struct client *con=malloc(sizeof(struct client));
+    bzero(con,sizeof(struct client));
+    con->fd=cfd;
+    con->rlen=255;
+    con->e=event_new(pm.loop, cfd, EV_READ|EV_PERSIST, handlec, con);
+    struct timeval tv;
+    tv.tv_sec=2;
+    tv.tv_usec=0;
+    con->tos=2;
+    event_add(con->e,&tv);
+    write(cfd,banner,strlen(banner));
+    printf("Client accepted fd %d\n",cfd);
 };
 
 int listenu(){
