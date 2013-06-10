@@ -39,6 +39,15 @@ int main(int argc, char *argv[]){
     a->port=htons(portnum);
     a->magic_number=htons(PM_SETUP);
     struct protoent * p=getprotobyname("tcp");
+    if(argc>=4){
+       p=getprotobyname(argv[3]);
+    }
+    if(argc>=5){
+       strncpy(a->protoname,argv[4],15);
+    }
+    if(argc>=6){
+        a->version=atoi(argv[5]);
+    }
     a->ipprotocol=p->p_proto;
     int r=send(fdu,a,len,0);
     printf("Request sent: %d\n",r);

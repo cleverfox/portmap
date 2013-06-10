@@ -33,6 +33,7 @@ struct service {
     uint8_t version;
     char protoname[16];
     struct connection *owner;
+    uint8_t matchany;
     TAILQ_ENTRY(service) entries;
     char servicename[];
 };
@@ -114,12 +115,20 @@ void handleu(evutil_socket_t fd, short what, void *arg){
         bzero(s,slen);
         s->port=ntohs(as->port);
         s->protocol=(as->ipprotocol);
-        strcpy(s->servicename,as->servicename);
-        strcpy(s->protoname ,as->protoname);
+        if(as->servicename[0]=='.'){
+            strcpy(s->servicename,as->servicename+1);
+            s->matchany=0;
+        }else{
+            strcpy(s->servicename,as->servicename);
+            s->matchany=1;
+        }
+        if(strlen(as->protoname)<1)
+            strcpy(s->protoname, "_");
+        else
+            strcpy(s->protoname, as->protoname);
         s->version=as->version;
         s->owner=c;
         TAILQ_INSERT_TAIL(&pm.services,s,entries);
-
         free(c->rbuf);
         c->rbuf=NULL;
         c->rlen=0;
@@ -167,11 +176,21 @@ void handlec(evutil_socket_t fd, short what, void *arg){
             printf("Received %s %d\n",c->rbuf,slen);
             if(strncasecmp(c->rbuf,"lookup ",7)==0){
                 //perform lookup
+                char *pattern=c->rbuf+7;
+                if(*pattern=='*')
+                    pattern=NULL;
                 struct service *s;
                 char obuf[255];
                 TAILQ_FOREACH(s,&pm.services,entries){
+                    if(pattern){
+                        if(strcmp(pattern,s->servicename)!=0) continue;
+                    }else{
+                        if(!s->matchany) continue;
+                    }
+
                     struct protoent *p=getprotobynumber(s->protocol);
-                    sprintf(obuf,"S %s %s %d\r\n",s->servicename,p->p_name,s->port);
+                    sprintf(obuf,"S %s %s %d %s %d\r\n",
+                            s->servicename,p->p_name,s->port,s->protoname,s->version);
                     send(fd,obuf,strlen(obuf),0);
                 }
                 send(fd,"%END\r\n\r\n",8,0);

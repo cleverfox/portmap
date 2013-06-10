@@ -105,7 +105,7 @@ void doread(evutil_socket_t fd, short what, void *arg){
             break;
         if(res<0)
             exit(0);
-        printf("%s %d\n",s,res);
+        printf("%s\n",s);
     }
 }
 
