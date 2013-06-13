@@ -1,8 +1,7 @@
 *~
 *.swp
 *.o
-assign
-pmassign
-portmap
+pmresolve
+pmsrv
 tags
-pmtest
+pmbind

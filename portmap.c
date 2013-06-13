@@ -1,356 +1,218 @@
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <arpa/inet.h>
 #include <unistd.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <sys/queue.h>
-#include <stdlib.h>
-#include <event2/event.h>
-#include <netdb.h>
+#include <fcntl.h>
 #include "portmap.h"
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <time.h>
+#include <stdio.h>
+#define PM_PORT 1248
 
-#define LOG_WRITE(loglevel, ...) {printf(__VA_ARGS__);printf("\n");}
-struct client {
-    int fd;
-    uint16_t rlen;
-    char rbuf[256];
-    uint16_t offset;
-    struct event *e;
-    char tos;
-};
-struct connection {
-    int fd;
-    uint16_t rlen;
-    uint8_t *rbuf;
-    uint16_t offset;
-    struct event *e;
-};
-struct service {
-    uint16_t port;
-    uint16_t protocol;
-    uint8_t version;
-    char protoname[16];
-    struct connection *owner;
-    uint8_t matchany;
-    TAILQ_ENTRY(service) entries;
-    char servicename[];
-};
-struct {
-    int fd4;
-    int fd6;
-    int fdu;
-    struct event *e4;
-    struct event *e6;
-    struct event *eu;
-    struct sockaddr_in  sin4;
-    struct sockaddr_in6 sin6;
-    struct sockaddr_un  sinu;
-    struct event_base *loop;
-    TAILQ_HEAD(servicetailq,service) services;
-} pm;
+#ifdef __MACH__ // OS X does not have clock_gettime, use clock_get_time
+#include <mach/mach.h>
+#include <mach/clock.h>
+#include <mach/mach_error.h>
 
-char banner[]="MiniPortmap version 0.1\r\n";
+#define CLOCK_MONOTONIC 1000
 
-void handleu(evutil_socket_t fd, short what, void *arg){
-    struct connection *c=arg;
-    printf("Got an event on service socket %d:%s%s%s%s\n",
-            (int) fd,
-            (what&EV_TIMEOUT) ? " timeout" : "",
-            (what&EV_READ)    ? " read" : "",
-            (what&EV_WRITE)   ? " write" : "",
-            (what&EV_SIGNAL)  ? " signal" : "");
-    if(!c->rbuf){
-        uint16_t lenbuf;
-        size_t len=read(fd,&lenbuf,2); 
-        if(len==0 || len!=2){
-            event_del(c->e);
-            close(fd);
-            free(c->e);
+static void  clock_gettime(int type, struct timespec *ts){
+    clock_serv_t cclock;
+    mach_timespec_t mts;
+    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
+    clock_get_time(cclock, &mts);
+    mach_port_deallocate(mach_task_self(), cclock);
+    ts->tv_sec = mts.tv_sec;
+    ts->tv_nsec = mts.tv_nsec;
+}
 
-            struct service *s,*s1;
-            TAILQ_FOREACH_SAFE(s,&pm.services,entries,s1){
-                if(s->owner==c){
-                    TAILQ_REMOVE(&pm.services,s,entries);
-                    free(s);
-                }
+#endif
+
+double dtime(){
+    struct timespec tv;
+    clock_gettime(CLOCK_MONOTONIC,&tv);
+    double sec;
+    sec=tv.tv_sec;
+    sec+=(double)tv.tv_nsec/100000000;
+    return sec;
+}
+
+
+int pm_sockread(struct portresolver *pr){
+    int r=read(pr->fd,pr->buf+pr->offset,pr->buflen-pr->offset);
+    if(r>0){
+        pr->offset+=r;
+    }else if(r==-1 && errno!=EAGAIN){
+        return 0;
+    }
+    return r;
+}
+
+char *pm_readSockLine(struct portresolver *pr, int *res){
+    if(pr->fd==-1){
+        if(res) *res=-1;
+        return NULL;
+    }
+    if(pr->start){
+        memcpy(pr->buf,pr->buf+pr->start,pr->offset-pr->start);
+        pr->offset-=pr->start;
+        pr->start=0;
+    }
+    double start=dtime();
+    while(1){
+        double now=dtime();
+        if(now-start>=pr->timeout){
+            if(res) *res=-70;
+            return NULL;
+        }
+        char *ptr=strstr(pr->buf,"\r\n");
+        if(ptr){
+            *ptr='\0';
+            pr->start=ptr+2-pr->buf;
+            if(res) *res=1;
+            if(strcmp(pr->buf,"%END")==0){
+                if(res) *res=-2;
+                close(pr->fd);
+                pr->fd=-1;
             }
-
-            free(c);
-            if(len==0)
-                printf("Connection finished on fd %d\n",fd);
-            else
-                printf("Connection error on fd %d. Can't read message length. Connection closed\n",fd);
-            return;
+            return pr->buf;
         }
-        c->rlen=htons(lenbuf);
-        printf("Read %ld bytes. expected %d\n",len,2);
-        uint8_t *buf=malloc(c->rlen+1);
-        bzero(buf,c->rlen+1);
-        memcpy(buf,&lenbuf,2);
-        c->rbuf=buf;
-        c->offset=2;
-    }
-    ssize_t len=read(fd,c->rbuf+c->offset,c->rlen-c->offset); 
-    if(len<0){
-        event_del(c->e);
-        close(fd);
-        free(c->e);
-        free(c->rbuf);
-        free(c);
-        printf("Connection closed on fd %d\n",fd);
-        return;
-    }
-    printf("Read %ld bytes. expected %d\n",len,c->rlen-c->offset);
-    c->offset+=len;
-    if(c->offset==c->rlen){
-        printf("Got complete message\n");
-        struct assign *as=(struct assign*)c->rbuf;
-        struct protoent *p=getprotobynumber(as->ipprotocol);
-        printf("Setup service %s at port %s %d with protocol %s version %d\n",
-                as->servicename,p->p_name,htons(as->port),as->protoname,as->version);
-        int slen=sizeof(struct service)+strlen(as->servicename)+1;
-        struct service *s=malloc(slen);
-        bzero(s,slen);
-        s->port=ntohs(as->port);
-        s->protocol=(as->ipprotocol);
-        if(as->servicename[0]=='.'){
-            strcpy(s->servicename,as->servicename+1);
-            s->matchany=0;
-        }else{
-            strcpy(s->servicename,as->servicename);
-            s->matchany=1;
+        int r=pm_sockread(pr);
+        if(r==0){
+            close(pr->fd);
+            pr->fd=-1;
+            if(res) *res=-2;
+            return NULL;
         }
-        if(strlen(as->protoname)<1)
-            strcpy(s->protoname, "_");
-        else
-            strcpy(s->protoname, as->protoname);
-        s->version=as->version;
-        s->owner=c;
-        TAILQ_INSERT_TAIL(&pm.services,s,entries);
-        free(c->rbuf);
-        c->rbuf=NULL;
-        c->rlen=0;
-        c->offset=0;
-    }
-}
-
-void handlec(evutil_socket_t fd, short what, void *arg){
-    struct client *c=arg;
-    printf("Got an event on client socket %d:%s%s%s%s\n",
-            (int) fd,
-            (what&EV_TIMEOUT) ? " timeout" : "",
-            (what&EV_READ)    ? " read" : "",
-            (what&EV_WRITE)   ? " write" : "",
-            (what&EV_SIGNAL)  ? " signal" : "");
-
-    if(what&EV_TIMEOUT){
-        c->tos--;
-        if(c->tos<=0){
-            event_del(c->e);
-            close(fd);
-            free(c->e);
-            free(c);
-            printf("Idle timeout. Connection finished on fd %d\n",fd);
-            return;
-        }
-    }
-    if(what&EV_READ){
-        c->tos=2;
-        size_t len=read(fd,c->rbuf,c->rlen-c->offset); 
-        if(len==0){
-            event_del(c->e);
-            close(fd);
-            free(c->e);
-            free(c);
-            printf("Connection finished on fd %d\n",fd);
-            return;
-        }
-        printf("Read %ld bytes. expected %d\n",len,c->rlen-c->offset);
-        c->offset+=len;
-        char *fs;
-        while((fs=strstr((const char*)c->rbuf,"\r\n"))!=NULL){
-            *fs='\0';
-            char slen=(long)fs-(long)c->rbuf;
-            printf("Received %s %d\n",c->rbuf,slen);
-            if(strncasecmp(c->rbuf,"lookup ",7)==0){
-                //perform lookup
-                char *pattern=c->rbuf+7;
-                if(*pattern=='*')
-                    pattern=NULL;
-                struct service *s;
-                char obuf[255];
-                TAILQ_FOREACH(s,&pm.services,entries){
-                    if(pattern){
-                        if(strcmp(pattern,s->servicename)!=0) continue;
-                    }else{
-                        if(!s->matchany) continue;
-                    }
-
-                    struct protoent *p=getprotobynumber(s->protocol);
-                    sprintf(obuf,"S %s %s %d %s %d\r\n",
-                            s->servicename,p->p_name,s->port,s->protoname,s->version);
-                    send(fd,obuf,strlen(obuf),0);
-                }
-                send(fd,"%END\r\n\r\n",8,0);
+        if(r==-1){
+            if(pr->block){
+                struct timespec slp;
+                slp.tv_nsec=500000;
+                slp.tv_sec=0;
+                nanosleep(&slp,NULL);
+            }else{
+                if(res) *res=-3;
+                return NULL;
             }
-            strcpy(c->rbuf,fs+2);
-            c->offset-=2+slen;
         }
     }
+    if(res) *res=-4;
+    return NULL;
 }
 
-void acceptu(evutil_socket_t fd, short what, void *arg){
-    printf("Got an event on listen unix socket %d:%s%s%s%s\n",
-            (int) fd,
-            (what&EV_TIMEOUT) ? " timeout" : "",
-            (what&EV_READ)    ? " read" : "",
-            (what&EV_WRITE)   ? " write" : "",
-            (what&EV_SIGNAL)  ? " signal" : "");
-    int cfd=accept(fd,NULL,NULL);
-    struct connection *con=malloc(sizeof(struct connection));
-    bzero(con,sizeof(struct connection));
-    con->fd=cfd;
-    con->e=event_new(pm.loop, cfd, EV_READ|EV_PERSIST, handleu, con);
-    event_add(con->e,NULL);
-    printf("Service accepted fd %d\n",cfd);
-};
+int pm_setNonblocking(unsigned int sd) {
+    unsigned int flags;
+    if (-1 == (flags = fcntl(sd, F_GETFL, 0)))
+        flags = 0;
+    return fcntl(sd, F_SETFL, flags | O_NONBLOCK);
+}
 
-void acceptc(evutil_socket_t fd, short what, void *arg){
-    printf("Got an event on listen inet socket %d:%s%s%s%s\n",
-            (int) fd,
-            (what&EV_TIMEOUT) ? " timeout" : "",
-            (what&EV_READ)    ? " read" : "",
-            (what&EV_WRITE)   ? " write" : "",
-            (what&EV_SIGNAL)  ? " signal" : "");
-    int cfd=accept(fd,NULL,NULL);
-    
-    struct client *con=malloc(sizeof(struct client));
-    bzero(con,sizeof(struct client));
-    con->fd=cfd;
-    con->rlen=255;
-    con->e=event_new(pm.loop, cfd, EV_READ|EV_PERSIST, handlec, con);
-    struct timeval tv;
-    tv.tv_sec=2;
-    tv.tv_usec=0;
-    con->tos=2;
-    event_add(con->e,&tv);
-    write(cfd,banner,strlen(banner));
-    printf("Client accepted fd %d\n",cfd);
-};
+int pm_csconnect(struct sockaddr *ssin,size_t socklen){
+    struct sockaddr_in6 *sin=(struct sockaddr_in6*) ssin;
+    sin->sin6_port=htons(1248);
 
-int listenu(){
-    pm.fdu = socket(PF_UNIX, SOCK_STREAM, 0);  
-    char ster[128];
-    if (pm.fdu == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error socket(): %s",(char*)&ster);
+    int fdu = socket(sin->sin6_family, SOCK_STREAM, 0);  
+    //char ster[128];
+    if (fdu == -1) {  
+        //strerror_r(errno,(char*)&ster,sizeof(ster));
+        //printf("Error socket(): %s\n",(char*)&ster);
         return -1;  
     }  
-    int on = 1; 
-    if (setsockopt(pm.fdu, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error setsockopt(): %s",(char*)&ster);  
-        return -1;  
-    } 
-    unlink(pm.sinu.sun_path);
-    if (bind(pm.fdu, (const struct sockaddr *)&pm.sinu, sizeof(struct sockaddr_un)) == -1) {
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error bind(): %s",(char*)&ster);
+    if (connect(fdu, ssin, socklen) == -1) {
+        //strerror_r(errno,(char*)&ster,sizeof(ster));
+        //printf("Error connect(): %s\n",(char*)&ster);
         return -1;
     }
-    if (listen(pm.fdu, 64/*backlog*/) == -1) {  
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error listen(): %s",strerror(errno));
-        return -1;  
-    }  
-    pm.eu=event_new(pm.loop, pm.fdu, EV_READ|EV_PERSIST, acceptu, NULL);
-    event_add(pm.eu,NULL);
-    return 0;
+    pm_setNonblocking(fdu);
+    return fdu;
 }
 
-int listen4(){
-    pm.fd4 = socket(PF_INET, SOCK_STREAM, 0);  
-    char ster[128];
-    if (pm.fd4 == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error socket(): %s",(char*)&ster);
-        return -1;  
-    }  
-    int on = 1; 
-    if (setsockopt(pm.fd4, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error setsockopt(): %s",(char*)&ster);  
-        return -1;  
-    } 
-    if (bind(pm.fd4, (const struct sockaddr *)&pm.sin4, sizeof(struct sockaddr_in)) == -1) {
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        char pbuf[64];
-        inet_ntop(AF_INET,&pm.sin4.sin_addr ,pbuf,64);
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error bind(): %s on %s:%d",(char*)&ster,pbuf,ntohs(pm.sin4.sin_port));  
-        return -1;
+int pm_cconnect(char *address){
+    struct sockaddr_in6 sin;
+
+    struct in_addr q;
+    if(inet_pton(AF_INET,address,&q.s_addr)==1){
+        ((struct sockaddr_in *)&sin)->sin_addr=q;
+        sin.sin6_family=AF_INET;
+        sin.sin6_len=sizeof(struct sockaddr_in);
+    }else if(inet_pton(AF_INET6,address,&sin.sin6_addr)==1){
+        sin.sin6_family=AF_INET6;
+        sin.sin6_len=sizeof(struct sockaddr_in6);
+    }else{
+        return -2;
     }
-    if (listen(pm.fd4, 64/*backlog*/) == -1) {  
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error listen(): %s",strerror(errno));
-        return -1;  
-    }  
-    pm.e4=event_new(pm.loop, pm.fd4, EV_READ|EV_PERSIST, acceptc, NULL);
-    event_add(pm.e4,NULL);
-    return 0;
+    return pm_csconnect((struct sockaddr*)&sin,sin.sin6_len);
 }
 
-int listen6(){
-    pm.fd6 = socket(PF_INET6, SOCK_STREAM, 0);  
-    char ster[128];
-    if (pm.fd6 == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error socket(): %s",(char*)&ster);
-        return -2;  
-    }  
-    int on = 1; 
-    if (setsockopt(pm.fd6, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {  
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error setsockopt(): %s",(char*)&ster);  
-        return -1;  
-    } 
-    if (setsockopt(pm.fd6, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) != 0){
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error setsockopt(): %s",(char*)&ster);  
-        return -3;
-    }
-    if (bind(pm.fd6, (struct sockaddr*)&pm.sin6, sizeof(struct sockaddr_in6)) == -1) {
-        strerror_r(errno,(char*)&ster,sizeof(ster));
-        char pbuf[64];
-        inet_ntop(AF_INET6,&pm.sin6.sin6_addr ,pbuf,64);
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error bind(): %s on %s:%d",(char*)&ster,pbuf,ntohs(pm.sin6.sin6_port));  
-        return -1;
-    }
-    
-    if (listen(pm.fd6, 64/*backlog*/) == -1) {  
-        LOG_WRITE(LF_SERVER|LL_ERROR,"Error listen(): %s",strerror(errno));
-        return -1;  
-    }  
-    pm.e6=event_new(pm.loop, pm.fd6, EV_READ|EV_PERSIST, acceptc, NULL);
-    event_add(pm.e6,NULL);
-    return 0;
+int simpleresolve(char *host, char *service, struct pm_resolve *pms, int pmsc){
+    int fdu=pm_cconnect(host);
+    if(fdu<0)
+        return fdu;
+    return simpleresolve2(fdu,service,pms,pmsc);
+
 }
 
-int main(int argc, char *argv[]){
-    LOG_WRITE(0,"Hello");
-    TAILQ_INIT(&pm.services);
-    pm.loop = event_base_new();
-    pm.sin4.sin_family=AF_INET;
-    pm.sin4.sin_addr.s_addr=INADDR_ANY;
-    pm.sin4.sin_port=htons(1248);
-    pm.sin6.sin6_family=AF_INET6;
-    pm.sin6.sin6_addr=in6addr_any;
-    pm.sin6.sin6_port=htons(1248);
-    pm.sinu.sun_family=AF_UNIX;
-    sprintf(pm.sinu.sun_path,"/tmp/portmap.1248");
-    pm.sinu.sun_len=strlen(pm.sinu.sun_path);
-    LOG_WRITE(0,"%d",listen4());
-    LOG_WRITE(0,"%d",listen6());
-    LOG_WRITE(0,"%d",listenu());
-    event_base_dispatch(pm.loop);
-    return 0;
+int simpleresolve2(int fdu, char *service, struct pm_resolve *pms, int pmsc){
+    struct portresolver pr;
+    pr.fd=fdu;
+    pr.block=1;
+    pr.offset=0;
+    pr.buflen=255;
+    pr.start=0;
+    pr.timeout=1;
+
+    char *s=NULL;
+    s=pm_readSockLine(&pr,NULL);
+
+    int r;
+    char a[255];
+    sprintf(a,"LOOKUP %s\r\n",service);
+    r=send(fdu,a,strlen(a),0);
+    int rc=0;
+
+    int res;
+    while(1){
+        char *s=pm_readSockLine(&pr,&res);
+        if(res==-70)
+            return -70;
+        if(res==-3)
+            break;
+        if(res<0)
+            break;
+        char *token;
+        int i=0;
+        //printf("* %s\n",s);
+        while ((token = strsep(&s, " ")) != NULL){
+            switch(i){
+                case 0:
+                    if(*token!='S')
+                        goto Out;
+                case 1:
+                    strcpy(pms[rc].servicename,token);
+                    break;
+                case 2:
+                    strcpy(pms[rc].ipprotocol,token);
+                    break;
+                case 3:
+                    pms[rc].port=atoi(token);
+                    break;
+                case 4:
+                    strcpy(pms[rc].protoname,token);
+                    break;
+                case 5:
+                    pms[rc].version=atoi(token);
+                    break;
+            }
+            i++;
+        }
+        rc++;
+Out:
+        if(rc>=pmsc)
+            break;
+
+    }
+    return rc;
 }
