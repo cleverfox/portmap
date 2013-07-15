@@ -46,6 +46,8 @@ int pm_sockread(struct portresolver *pr);
 char *pm_readSockLine(struct portresolver *pr, int *res);
 int pm_setNonblocking(unsigned int sd);
 int pm_cconnect(char *address);
+int pm_register(int fd, char* servicename, char* protocol, unsigned short port, char* protocolname, unsigned char protocolversion);
+int pm_unregister(int fd, char* protocol, unsigned short port); 
 int simpleresolve(char *host, char *service, struct pm_resolve *pms, int pmsc);
 int simpleresolve2(int fdu, char *service, struct pm_resolve *pms, int pmsc);
 

@@ -110,57 +110,72 @@ void handleu(evutil_socket_t fd, short what, void *arg){
     //printf("Read %ld bytes. expected %d\n",len,c->rlen-c->offset);
     c->offset+=len;
     if(c->offset==c->rlen){
-        //printf("Got complete message\n");
         struct assign *as=(struct assign*)c->rbuf;
-        struct protoent *p=getprotobynumber(as->ipprotocol);
-        struct service *ts;
-        TAILQ_FOREACH(ts,&pm.services,entries){
-            if(ts->port==as->port && ts->protocol==as->ipprotocol){
-                LOG_WRITE(0,"Can't Setup service %s at port %s %d with protocol %s version %d\n",
-                        as->servicename,p->p_name,(as->port),as->protoname,as->version);
-                struct pm_result pr;
-                pr.length=(sizeof(pr));
-                pr.magic_number=(PM_SETUPNO);
-                pr.port=(as->port);
-                pr.ipprotocol=as->ipprotocol;
-                send(fd,&pr,sizeof(pr),0);
-                goto finish;
+        LOG_WRITE(0,"Got complete message %x\n",as->magic_number);
+        if(as->magic_number==PM_SETUP){
+            struct protoent *p=getprotobynumber(as->ipprotocol);
+            struct service *ts;
+            TAILQ_FOREACH(ts,&pm.services,entries){
+                if(ts->port==as->port && ts->protocol==as->ipprotocol){
+                    LOG_WRITE(0,"Can't Setup service %s at port %s %d with protocol %s version %d\n",
+                            as->servicename,p->p_name,(as->port),as->protoname,as->version);
+                    struct pm_result pr;
+                    pr.length=(sizeof(pr));
+                    pr.magic_number=(PM_SETUPNO);
+                    pr.port=(as->port);
+                    pr.ipprotocol=as->ipprotocol;
+                    send(fd,&pr,sizeof(pr),0);
+                    goto finish;
+                }
+            }
+            LOG_WRITE(0,"Setup service %s at port %s %d with protocol %s version %d\n",
+                    as->servicename,p->p_name,(as->port),as->protoname,as->version);
+
+            int slen=sizeof(struct service)+strlen(as->servicename)+1;
+            struct service *s=malloc(slen);
+            bzero(s,slen);
+            s->port=as->port;
+            s->protocol=as->ipprotocol;
+            int i=0;
+            for(;i<strlen(as->servicename);i++){
+                if(as->servicename[i]==' ')
+                    as->servicename[i]='_';
+            }
+            if(as->servicename[0]=='.'){
+                strcpy(s->servicename,as->servicename+1);
+                s->matchany=0;
+            }else{
+                strcpy(s->servicename,as->servicename);
+                s->matchany=1;
+            }
+            if(strlen(as->protoname)<1)
+                strcpy(s->protoname, "_");
+            else
+                strcpy(s->protoname, as->protoname);
+            s->version=as->version;
+            s->owner=c;
+            TAILQ_INSERT_TAIL(&pm.services,s,entries);
+            free(c->rbuf);
+            struct pm_result pr;
+            pr.length=(sizeof(pr));
+            pr.magic_number=(PM_SETUPOK);
+            pr.port=(as->port);
+            pr.ipprotocol=as->ipprotocol;
+            send(fd,&pr,sizeof(pr),0);
+        }
+        if(as->magic_number==PM_RELEASE){
+            struct protoent *p=getprotobynumber(as->ipprotocol);
+            struct service *ts;
+            TAILQ_FOREACH(ts,&pm.services,entries){
+                if(ts->port==as->port && ts->protocol==as->ipprotocol){
+                    LOG_WRITE(0,"Release service %s at port %s %d with protocol %s version %d\n",
+                            ts->servicename,p->p_name,(ts->port),ts->protoname,ts->version);
+                    TAILQ_REMOVE(&pm.services,ts,entries);
+                    free(ts);
+                    break;
+                }
             }
         }
-        LOG_WRITE(0,"Setup service %s at port %s %d with protocol %s version %d\n",
-                as->servicename,p->p_name,(as->port),as->protoname,as->version);
-
-        int slen=sizeof(struct service)+strlen(as->servicename)+1;
-        struct service *s=malloc(slen);
-        bzero(s,slen);
-        s->port=as->port;
-        s->protocol=as->ipprotocol;
-        int i=0;
-        for(;i<strlen(as->servicename);i++){
-            if(as->servicename[i]==' ')
-                as->servicename[i]='_';
-        }
-        if(as->servicename[0]=='.'){
-            strcpy(s->servicename,as->servicename+1);
-            s->matchany=0;
-        }else{
-            strcpy(s->servicename,as->servicename);
-            s->matchany=1;
-        }
-        if(strlen(as->protoname)<1)
-            strcpy(s->protoname, "_");
-        else
-            strcpy(s->protoname, as->protoname);
-        s->version=as->version;
-        s->owner=c;
-        TAILQ_INSERT_TAIL(&pm.services,s,entries);
-        free(c->rbuf);
-        struct pm_result pr;
-        pr.length=(sizeof(pr));
-        pr.magic_number=(PM_SETUPOK);
-        pr.port=(as->port);
-        pr.ipprotocol=as->ipprotocol;
-        send(fd,&pr,sizeof(pr),0);
 
 finish:
         c->rbuf=NULL;
@@ -393,7 +408,7 @@ int run_portmap(void){
     pm.sin4.sin_port=htons(1248);
     pm.sin6.sin6_family=AF_INET6;
     pm.sin6.sin6_addr=in6addr_any;
-    pm.sin6.sin6_port=htons(1249);
+    pm.sin6.sin6_port=htons(1248);
     pm.sinu.sun_family=AF_UNIX;
     sprintf(pm.sinu.sun_path,"/tmp/portmap.1248");
     pm.sinu.sun_len=strlen(pm.sinu.sun_path);
