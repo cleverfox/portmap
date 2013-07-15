@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <time.h>
 #include <stdio.h>
+#include <netdb.h>
 #define PM_PORT 1248
 
 #ifdef __MACH__ // OS X does not have clock_gettime, use clock_get_time
@@ -35,8 +36,9 @@ double dtime(){
     struct timespec tv;
     clock_gettime(CLOCK_MONOTONIC,&tv);
     double sec;
-    sec=tv.tv_sec;
-    sec+=(double)tv.tv_nsec/100000000;
+    sec=(double)tv.tv_nsec;
+    sec/=100000000;
+    sec+=tv.tv_sec;
     return sec;
 }
 
@@ -90,7 +92,7 @@ char *pm_readSockLine(struct portresolver *pr, int *res){
         if(r==-1){
             if(pr->block){
                 struct timespec slp;
-                slp.tv_nsec=500000;
+                slp.tv_nsec=50000000;
                 slp.tv_sec=0;
                 nanosleep(&slp,NULL);
             }else{
@@ -151,7 +153,9 @@ int simpleresolve(char *host, char *service, struct pm_resolve *pms, int pmsc){
     int fdu=pm_cconnect(host);
     if(fdu<0)
         return fdu;
-    return simpleresolve2(fdu,service,pms,pmsc);
+    int r=simpleresolve2(fdu,service,pms,pmsc);
+    close(fdu);
+    return r;
 
 }
 
@@ -162,7 +166,7 @@ int simpleresolve2(int fdu, char *service, struct pm_resolve *pms, int pmsc){
     pr.offset=0;
     pr.buflen=255;
     pr.start=0;
-    pr.timeout=1;
+    pr.timeout=2;
 
     char *s=NULL;
     s=pm_readSockLine(&pr,NULL);
@@ -215,4 +219,68 @@ Out:
 
     }
     return rc;
+}
+int pm_unregister(int fd, char* protocol, unsigned short port){ 
+    if(fd<1)
+        return -5;
+    pm_setNonblocking(fd);
+    char buf[64];
+    while(read(fd,buf,64)!=-1);
+    int len=sizeof(struct assign);
+    struct assign *a=alloca(len);
+    bzero(a,len);
+    a->length=(len);
+    a->port=(port);
+    a->magic_number=(PM_RELEASE);
+    struct protoent * p=getprotobyname(protocol);
+    a->ipprotocol=p->p_proto;
+    int r=send(fd,a,len,0);
+    if(r<=0)
+        return -1;
+    return 0;
+}
+int pm_register(int fd, char* servicename, char* protocol, unsigned short port, char* protocolname, unsigned char protocolversion){
+    if(fd<1)
+        return -5;
+    pm_setNonblocking(fd);
+    char buf[64];
+    while(read(fd,buf,64)!=-1);
+    int len=sizeof(struct assign)+strlen(servicename)+1;
+    struct assign *a=alloca(len);
+    bzero(a,len);
+    a->length=(len);
+    strcpy(a->servicename,servicename);
+    a->port=(port);
+    a->magic_number=(PM_SETUP);
+    struct protoent * p=getprotobyname(protocol);
+    strncpy(a->protoname,protocolname,15);
+    a->version=protocolversion;
+    a->ipprotocol=p->p_proto;
+    int r=send(fd,a,len,0);
+    if(r<=0)
+        return -1;
+
+    char rb[16];
+    struct pm_result *pmr=(void*)rb;
+    r=read(fd,rb,2);
+    if(r!=2){
+        return 0;
+    }
+    if(pmr->length>16){
+        return 0;
+    }
+    while((r=read(fd,rb+2,pmr->length-2))>0){
+        if(r!=pmr->length-2){
+            printf("Error %d!\n",r);
+            return 0;
+        }
+        if(pmr->magic_number==PM_SETUPOK){
+            printf("Successfully registered port %d with protocol %d\n",pmr->port,pmr->ipprotocol);
+            return 1;
+        }else{
+            printf("Can't register port %d at protocol %d\n",pmr->port,pmr->ipprotocol);
+            return -2;
+        }
+    }
+    return 0;
 }

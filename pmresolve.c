@@ -66,7 +66,7 @@ int main(int argc, char *argv[]){
     pr.offset=0;
     pr.buflen=255;
     pr.start=0;
-    pr.timeout=0.01;
+    pr.timeout=1.1;
 
     char *s=NULL;
     pr.block=1;
@@ -124,7 +124,7 @@ int main(int argc, char *argv[]){
           }
           pm_setNonblocking(fdu);
           printf("Connected to %s\n",buffer);
-          r=simpleresolve2(fdu,"*",rres,10);
+          r=simpleresolve2(fdu,argv[2],rres,10);
           printf("res %d\n",r);
           if(r){
               
