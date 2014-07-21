@@ -1,5 +1,5 @@
 CFLAGS=-g -I/usr/local/include
-LDFLAGS=-levent -L/usr/local/lib/event2
+LDFLAGS=-levent_core -L/usr/local/lib/event2 -static
 all: pmsrv pmbind pmresolve
 
 pmsrv: pmsrv.o portmap.o pmsrv_run.o

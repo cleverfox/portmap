@@ -11,6 +11,8 @@
 #include <event2/event.h>
 #include <netdb.h>
 #include <syslog.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include "portmap.h"
 
 //#define LOG_WRITE(loglevel, ...) {printf(__VA_ARGS__);printf("\n");}
@@ -448,6 +450,12 @@ int run_portmap(void){
     event_add(pm.e6,NULL);
     pm.eu=event_new(pm.loop, pm.fdu, EV_READ|EV_PERSIST, acceptu, NULL);
     event_add(pm.eu,NULL);
+
+
+    int fd = open("/dev/tty", O_RDWR);
+    ioctl(fd, TIOCNOTTY, NULL);
+
+    setpgid(getpid(), 0);
 
     event_base_dispatch(pm.loop);
     return 0;
